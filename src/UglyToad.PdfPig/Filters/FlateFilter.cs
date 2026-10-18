@@ -51,6 +51,20 @@
         private const byte Deflate32KbWindow = 120;
         private const byte ChecksumBits = 1;
 
+        private readonly int maximumDecodedLength;
+
+        /// <summary>
+        /// Create a new <see cref="FlateFilter"/>.
+        /// </summary>
+        public FlateFilter() : this(DecodeBuffer.MaximumDecodedLength)
+        {
+        }
+
+        internal FlateFilter(int maximumDecodedLength)
+        {
+            this.maximumDecodedLength = maximumDecodedLength;
+        }
+
         /// <inheritdoc />
         public bool IsSupported { get; } = true;
 
@@ -63,9 +77,9 @@
 
             try
             {
-                return Decompress(input, predictor, colors, bitsPerComponent, columns, streamDictionary);
+                return Decompress(input, predictor, colors, bitsPerComponent, columns, streamDictionary, maximumDecodedLength);
             }
-            catch
+            catch (Exception ex) when (ex is not DecodeLimitExceededException)
             {
                 // This used to hand the compressed input back without a word. Nothing above
                 // can tell that apart from content, so a stream that failed to decode arrived
@@ -73,7 +87,8 @@
                 // looked the same, which is the more expensive half: the failure is invisible
                 // to a test run as well. Every other filter in this folder lets its exceptions
                 // out. This one keeps catching because it is the filter that meets damaged
-                // documents, but it returns nothing rather than the input.
+                // documents, but it returns nothing rather than the input. A stream over the
+                // decode limit is not damage, so that refusal is let out like the other filters'.
                 return Memory<byte>.Empty;
             }
         }
@@ -83,13 +98,14 @@
             int colors,
             int bitsPerComponent,
             int columns,
-            DictionaryToken streamDictionary)
+            DictionaryToken streamDictionary,
+            int limit)
         {
-            var decoded = Inflate(input, predictor, colors, bitsPerComponent, columns, streamDictionary, FastBlockLength, salvaging: false, out var damaged);
+            var decoded = Inflate(input, predictor, colors, bitsPerComponent, columns, streamDictionary, FastBlockLength, salvaging: false, limit, out var damaged);
 
             if (damaged)
             {
-                decoded = Inflate(input, predictor, colors, bitsPerComponent, columns, streamDictionary, SalvageBlockLength, salvaging: true, out _);
+                decoded = Inflate(input, predictor, colors, bitsPerComponent, columns, streamDictionary, SalvageBlockLength, salvaging: true, limit, out _);
             }
 
             return decoded;
@@ -103,6 +119,7 @@
             DictionaryToken streamDictionary,
             int blockLength,
             bool salvaging,
+            int limit,
             out bool damaged)
         {
             using var memoryStream = MemoryHelper.AsReadOnlyMemoryStream(input);
@@ -128,13 +145,13 @@
                 && TryGetImageHeight(streamDictionary, out var height)
                 && DecodeBuffer.IsPlausible((long)height * decoder.RowLength, input.Length, MaximumExpansion))
             {
-                return DecompressImage(memoryStream, predictor, colors, bitsPerComponent, columns, height, blockLength, salvaging, out damaged);
+                return DecompressImage(memoryStream, predictor, colors, bitsPerComponent, columns, height, blockLength, salvaging, limit, out damaged);
             }
 
             // The inflater writes straight into this buffer, and the predictor is undone in the
             // same buffer as the rows arrive; the caller gets a copy of just the finished length.
             // The buffer is sized from the dictionary where that states the decoded length.
-            var buffer = ArrayPool<byte>.Shared.Rent(DecodeBuffer.Capacity(input.Length, streamDictionary, InitialCapacityFactor, MinimumCapacity, MaximumExpansion));
+            var buffer = ArrayPool<byte>.Shared.Rent(DecodeBuffer.Capacity(input.Length, streamDictionary, InitialCapacityFactor, MinimumCapacity, MaximumExpansion, limit));
 
             var length = 0;
 
@@ -150,16 +167,27 @@
                     {
                         // A block at a time, or the room that is left when a buffer sized from the
                         // dictionary is about to fit exactly; grown only once it is full.
-                        if (buffer.Length == length)
+                        if (DecodeBuffer.Usable(buffer, limit) == length)
                         {
-                            DecodeBuffer.Grow(ref buffer, length, (long)length + blockLength);
+                            if (length >= limit)
+                            {
+                                // Full at the limit: the stream is refused only if there is more to come.
+                                if (deflate.Read(new byte[1], 0, 1) == 0)
+                                {
+                                    break;
+                                }
+
+                                throw DecodeBuffer.TooLarge(limit);
+                            }
+
+                            DecodeBuffer.Grow(ref buffer, length, Math.Min((long)length + blockLength, limit), limit);
                         }
 
                         int read;
 
                         try
                         {
-                            read = deflate.Read(buffer, length, Math.Min(blockLength, buffer.Length - length));
+                            read = deflate.Read(buffer, length, Math.Min(blockLength, DecodeBuffer.Usable(buffer, limit) - length));
                         }
                         catch (InvalidDataException)
                         {
@@ -197,7 +225,8 @@
 
                     if (required > buffer.Length)
                     {
-                        DecodeBuffer.Grow(ref buffer, length, required);
+                        // The padded last row may reach one stride past the inflated data.
+                        DecodeBuffer.Grow(ref buffer, length, required, (int)Math.Min(DecodeBuffer.MaximumCapacity, (long)limit + decoder.Stride));
                     }
 
                     length = decoder.Finish(buffer, length);
@@ -229,13 +258,13 @@
         /// produces them, from a small input buffer that stays in the cache; nothing is moved or copied
         /// afterwards. A /Height that turns out wrong is grown around or trimmed at the end.
         /// </summary>
-        private static Memory<byte> DecompressImage(Stream compressed, int predictor, int colors, int bitsPerComponent, int columns, int height, int blockLength, bool salvaging, out bool damaged)
+        private static Memory<byte> DecompressImage(Stream compressed, int predictor, int colors, int bitsPerComponent, int columns, int height, int blockLength, bool salvaging, int limit, out bool damaged)
         {
             var decoder = new PngPredictor.Decoder(predictor, colors, bitsPerComponent, columns);
             var rowLength = decoder.RowLength;
             var stride = decoder.Stride;
 
-            var output = AllocateResult((int)Math.Min(DecodeBuffer.MaximumCapacity, (long)height * rowLength));
+            var output = AllocateResult((int)Math.Min(limit, (long)height * rowLength));
 
             // One block of inflated data plus the row it may complete.
             var buffer = ArrayPool<byte>.Shared.Rent(Math.Max(MinimumCapacity, stride + blockLength));
@@ -251,7 +280,8 @@
                     {
                         if (buffer.Length - length < blockLength)
                         {
-                            DecodeBuffer.Grow(ref buffer, length, (long)length + blockLength);
+                            // Input waiting to make a row, not output, so only an array's size bounds it.
+                            DecodeBuffer.Grow(ref buffer, length, (long)length + blockLength, DecodeBuffer.MaximumCapacity);
                         }
 
                         int read;
@@ -275,7 +305,7 @@
                         length += read;
 
                         var completeRows = (length - decoder.ConsumedLength) / stride;
-                        EnsureOutput(ref output, decoder.DecodedLength, decoder.DecodedLength + (completeRows * rowLength));
+                        EnsureOutput(ref output, decoder.DecodedLength, decoder.DecodedLength + ((long)completeRows * rowLength), limit);
 
                         decoder.Advance(buffer, length, output);
 
@@ -294,7 +324,7 @@
                     return Memory<byte>.Empty;
                 }
 
-                EnsureOutput(ref output, decoder.DecodedLength, decoder.FinalLength(length));
+                EnsureOutput(ref output, decoder.DecodedLength, decoder.FinalLength(length), limit);
 
                 var decodedLength = decoder.Finish(buffer, length, output);
 
@@ -334,16 +364,16 @@
         }
 
         /// <summary>Grows the result when a stream has more rows than its /Height said, carrying over the <paramref name="written"/> bytes decoded so far.</summary>
-        private static void EnsureOutput(ref byte[] output, int written, int required)
+        private static void EnsureOutput(ref byte[] output, int written, long required, int limit)
         {
             if (required > output.Length)
             {
-                if (output.Length >= DecodeBuffer.MaximumCapacity)
+                if (required > limit)
                 {
-                    throw new CorruptCompressedDataException("The image decodes to more than can be held in one array.");
+                    throw DecodeBuffer.TooLarge(limit);
                 }
 
-                var grown = AllocateResult((int)Math.Min(DecodeBuffer.MaximumCapacity, Math.Max(required, output.Length * 2L)));
+                var grown = AllocateResult((int)Math.Min(limit, Math.Max(required, output.Length * 2L)));
                 output.AsSpan(0, written).CopyTo(grown);
                 output = grown;
             }

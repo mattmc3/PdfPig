@@ -8,6 +8,7 @@
     using Integration;
     using PdfPig.Core;
     using PdfPig.Filters;
+    using PdfPig.Fonts;
     using PdfPig.Tokens;
 
     public class LzwFilterTests
@@ -49,6 +50,24 @@
             var input = new byte[] { 0x80, 0x4B, 0x00 };
 
             Assert.Throws<InvalidOperationException>(() => filter.Decode(input, NoParameters, TestFilterProvider.Instance, 0));
+        }
+
+        [Fact]
+        public void RefusesStreamOverDecodeLimit()
+        {
+            const int limit = 64 * 1024;
+            var encoded = LzwEncoder.Encode(new byte[limit * 4], true, out _);
+
+            Assert.Throws<DecodeLimitExceededException>(() => new LzwFilter(limit).Decode(encoded, NoParameters, TestFilterProvider.Instance, 0));
+        }
+
+        [Fact]
+        public void DecodesStreamWithinDecodeLimit()
+        {
+            const int limit = 64 * 1024;
+            var encoded = LzwEncoder.Encode(new byte[limit / 2], true, out _);
+
+            Assert.Equal(limit / 2, new LzwFilter(limit).Decode(encoded, NoParameters, TestFilterProvider.Instance, 0).Length);
         }
 
         [Theory]

@@ -12,6 +12,20 @@
     {
         private const byte EndOfDataLength = 128;
 
+        private readonly int maximumDecodedLength;
+
+        /// <summary>
+        /// Create a new <see cref="RunLengthFilter"/>.
+        /// </summary>
+        public RunLengthFilter() : this(DecodeBuffer.MaximumDecodedLength)
+        {
+        }
+
+        internal RunLengthFilter(int maximumDecodedLength)
+        {
+            this.maximumDecodedLength = maximumDecodedLength;
+        }
+
         /// <inheritdoc />
         public bool IsSupported { get; } = true;
 
@@ -33,6 +47,12 @@
                 }
 
                 // if length byte in range 0 - 127 copy the following length + 1 bytes literally to the output.
+                var runOutput = runLength <= 127 ? runLength + 1 : 257 - runLength;
+                if (output.WrittenCount + runOutput > maximumDecodedLength)
+                {
+                    throw DecodeBuffer.TooLarge(maximumDecodedLength);
+                }
+
                 if (runLength <= 127)
                 {
                     var rangeToWriteLiterally = runLength + 1;

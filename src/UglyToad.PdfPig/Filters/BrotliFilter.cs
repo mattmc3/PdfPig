@@ -59,6 +59,20 @@
             "Invalid Brotli compressed stream encountered. A stream using large window Brotli "
             + "(IETF RFC 9841) fails in the same way, as the decoder does not support it.";
 
+        private readonly int maximumDecodedLength;
+
+        /// <summary>
+        /// Create a new <see cref="BrotliFilter"/>.
+        /// </summary>
+        public BrotliFilter() : this(DecodeBuffer.MaximumDecodedLength)
+        {
+        }
+
+        internal BrotliFilter(int maximumDecodedLength)
+        {
+            this.maximumDecodedLength = maximumDecodedLength;
+        }
+
         /// <inheritdoc />
         public bool IsSupported { get; } = true;
 
@@ -81,11 +95,11 @@
             // from the dictionary where that states the decoded length, as embedded files do. A
             // single Brotli copy may run to 16 MB, so no expansion ratio bounds what a stated length
             // may plausibly be; only the absolute ceiling does.
-            var buffer = ArrayPool<byte>.Shared.Rent(DecodeBuffer.Capacity(input.Length, streamDictionary, InitialCapacityFactor, MinimumCapacity, DecodeBuffer.UnboundedExpansion));
+            var buffer = ArrayPool<byte>.Shared.Rent(DecodeBuffer.Capacity(input.Length, streamDictionary, InitialCapacityFactor, MinimumCapacity, DecodeBuffer.UnboundedExpansion, maximumDecodedLength));
 
             try
             {
-                var total = Decompress(input, ref buffer);
+                var total = Decompress(input, ref buffer, maximumDecodedLength);
 
                 // The Flate filter decodes rows as they inflate, straight into the result, which
                 // spares it a buffer for the whole inflated stream. The Brotli decoder hands over
@@ -105,7 +119,7 @@
         /// Decompresses the whole stream into <paramref name="buffer"/>, growing it as needed, and returns
         /// the number of bytes decompressed.
         /// </summary>
-        private static int Decompress(Memory<byte> input, ref byte[] buffer)
+        private static int Decompress(Memory<byte> input, ref byte[] buffer, int limit)
         {
             var total = 0;
 
@@ -117,7 +131,7 @@
 
                 while (true)
                 {
-                    var status = decoder.Decompress(remaining.Span, buffer.AsSpan(total), out var consumed, out var written);
+                    var status = decoder.Decompress(remaining.Span, buffer.AsSpan(total, DecodeBuffer.Usable(buffer, limit) - total), out var consumed, out var written);
 
                     total += written;
                     remaining = remaining.Slice(consumed);
@@ -143,8 +157,8 @@
                         throw new CorruptCompressedDataException(InvalidStreamMessage);
                     }
 
-                    // The buffer doubles; a stream too large for one array is refused there.
-                    DecodeBuffer.Grow(ref buffer, total, buffer.Length + 1L);
+                    // The buffer doubles; a stream decoding to more than the limit is refused there.
+                    DecodeBuffer.Grow(ref buffer, total, DecodeBuffer.Usable(buffer, limit) + 1L, limit);
                 }
             }
             catch (Exception ex) when (ex is InvalidOperationException || ex is InvalidDataException)

@@ -15,6 +15,13 @@
         public const int MaximumCapacity = 0x7FFFFFC7;
 
         /// <summary>
+        /// The most a filter decodes one stream to. A few compressed bytes can otherwise decode to as
+        /// much as one array holds, so an untrusted file could exhaust memory (#1435). The same bound
+        /// as the CCITT decoder's.
+        /// </summary>
+        public const int MaximumDecodedLength = 256 * 1024 * 1024;
+
+        /// <summary>
         /// For a filter whose compression has no usable bound on how far it can expand, as Brotli
         /// has not: only <see cref="MaximumStatedLength"/> then limits a stated length.
         /// </summary>
@@ -41,6 +48,14 @@
         /// <paramref name="minimum"/>. Plausible means no more than <paramref name="maximumExpansion"/>
         /// times the compressed length, the most the filter's compression can expand by. A stated
         /// length is a hint; a buffer that was short grows.
+        /// </summary>
+        public static int Capacity(int compressedLength, DictionaryToken streamDictionary, int factor, int minimum, int maximumExpansion, int limit)
+        {
+            return Math.Min(limit, Capacity(compressedLength, streamDictionary, factor, minimum, maximumExpansion));
+        }
+
+        /// <summary>
+        /// <see cref="Capacity(int, DictionaryToken, int, int, int, int)"/> without a decode limit.
         /// </summary>
         public static int Capacity(int compressedLength, DictionaryToken streamDictionary, int factor, int minimum, int maximumExpansion)
         {
@@ -83,24 +98,37 @@
 
         /// <summary>
         /// Replaces a rented buffer with a larger one, at least <paramref name="required"/> bytes and
-        /// otherwise twice the size, carrying over the <paramref name="written"/> bytes. A stream
-        /// that decodes to more than one array can hold is refused, in every filter alike, rather
-        /// than cut short in silence.
+        /// otherwise twice the size up to <paramref name="limit"/>, carrying over the
+        /// <paramref name="written"/> bytes. A stream that needs more than the limit is refused, in
+        /// every filter alike, rather than cut short in silence.
         /// </summary>
-        public static void Grow(ref byte[] buffer, int written, long required)
+        public static void Grow(ref byte[] buffer, int written, long required, int limit)
         {
-            if (required > MaximumCapacity || buffer.Length >= MaximumCapacity)
+            if (required > limit)
             {
-                throw new CorruptCompressedDataException("The stream decodes to more than can be held in one array.");
+                throw TooLarge(limit);
             }
 
-            var grown = ArrayPool<byte>.Shared.Rent((int)Math.Min(MaximumCapacity, Math.Max(required, buffer.Length * 2L)));
+            var grown = ArrayPool<byte>.Shared.Rent((int)Math.Min(limit, Math.Max(required, buffer.Length * 2L)));
 
             // Only what was written: the rest of a rented buffer is whatever the pool left in it.
             buffer.AsSpan(0, written).CopyTo(grown);
             ArrayPool<byte>.Shared.Return(buffer);
 
             buffer = grown;
+        }
+
+        public static DecodeLimitExceededException TooLarge(int limit)
+        {
+            return new DecodeLimitExceededException(limit);
+        }
+
+        /// <summary>
+        /// How much of a rented buffer a decoder may fill: the pool may hand out more than was asked for.
+        /// </summary>
+        public static int Usable(byte[] buffer, int limit)
+        {
+            return Math.Min(buffer.Length, limit);
         }
 
         private static bool TryGetLength(DictionaryToken streamDictionary, NameToken key, out long length)
